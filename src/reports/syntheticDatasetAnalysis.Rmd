@@ -1,0 +1,256 @@
+---
+title: "Analsys of synthetic datasets for seasonality tests"
+date: "25-Mar-2023"
+header-includes:
+- \usepackage{booktabs}
+output: 
+  pdf_document:
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = FALSE)
+
+source("../functions/utils.r")
+
+library("lubridate")
+library("pander")
+library("knitr")
+library("kableExtra")
+library("ggplot2")
+library("corrplot")                               # Load corrplot
+
+panderOptions('round',4)
+panderOptions('keep.trailing.zeros',TRUE)
+
+numericCols <- c("x1","x2",
+                        "r1","r2","r3","r4","r5","r6","r7","r8","r9","r10",
+                        "c1_1","c1_2","c1_3","c1_4","c1_5","c1_6","c1_7","c1_8","c1_9","c1_10",
+                        "c2_1","c2_2","c2_3","c2_4","c2_5","c2_6","c2_7","c2_8","c2_9","c2_10")
+
+datasetPath <- "../../data/"
+
+# Set this to 'TRUE'  to save the generated images to the output folder
+dumpImg     <- FALSE
+figurePath  <- "../../output/img/"
+
+```
+
+# Introduction
+
+This document serves as a _commented script_ to generate and visualize synthetic datasets that try to simulate different seasonal effects in clinical data. Furthermore, these datasets present high dimensionality and class imbalance to challenge even more the prediction algorithms.
+
+# Background model
+
+Let consider a very simple model to generate data:
+
+$k_1 x_1 + k_2 x_2 = y$
+
+being $x_1$ and $x_2$ two random variables in the interval $[-10,10]$. The values of $k_1$ and $k_2$ are the unknown factors of the model to be discovered. Since we focus on classification models, a binary outcome $class$ is generated with two values: \emph{non-negative} if $y \geq 0$ and \emph{negative} otherwise.
+
+To simulate a seasonal concept drift, we change the values of $k_1$ and $k_2$ along the year. $k_1$ can vary from 0 to 1 and $k_2$ is calculated as $k_2 = 1 - k_1$
+
+Furthermore, we add extra variables, not directly related with the model, to simulate the problem of high dimensionality. We add 10 random variables, $r_1$ to $r_10$ that will follow a uniform distribution with values in $[-10,10]$. Furthermore, we add other 10 variables $c^1_j, j \in {1,...,10}$, correlated with $x_1$ and other 10 $c^2_j, j \in {1,...,10}$ correlated with $x_2$. These variables are calculated as follows:
+
+$c^i_j = x_i + \epsilon, \epsilon \sim U(-5,5)$
+
+By this way, these $c^i_j$ variables have a value similar to the ones that really affect the outcome of the model but with an additional random error so as to make them not perfectly correlated.
+
+Therefore, the final synthetic datasets contain a total of 34 columns: 1 timestamp column with a random date between 01-Jan-2100 and 31-Dec-2199, 1 nominal column that indicates the class of the observation (non-positive, positive), 2 columns ($x_1$ and $x_2$) that really affect the class but with variations along time, 10 columns $r_1,...,r_10$ absolutely random and 20 columns $c^1_1,...,c^1_10,c^2_1,...,c^2_10$ correlated with $x_1$ or $x_2$.
+
+To increase the complexity of the dataset, a class imbalance of 10:1 is simulated. Once each dataset is generated, we assume that the \emph{non-negative} class is the minority one and randomly remove samples up to have 10 \emph{negative} samples for each \emph{non-negative} sample.
+
+
+```{r syntheticFunctions}
+generateFactorCondensed <- function(date) {
+  # This function generates the values of the factor k1 assuming a ``condensed'' seasonal effect in winter
+  #
+  #
+  require(lubridate)
+  
+  d             <- date
+  year(d)       <- 2000
+  minDateEffect <- winterSolstice1999
+  maxDateEffect <- springEquinox2000-1
+  year(minDateEffect) <- 1999
+  year(maxDateEffect) <- 2000
+  # Any date posterior to the spring solstice is 'moved' to 1999. By this way, 
+  # our dates will range from 21-Mar-1999 to 20-Mar-2000, saving leap year and inter-year dates problems.
+  if (d>maxDateEffect) { 
+    year(d)<-1999
+  }
+  
+  if (d<minDateEffect || d>maxDateEffect) return(0.0)
+  
+  totalDays    <- as.numeric(maxDateEffect - minDateEffect)
+  currentDays  <- as.numeric(maxDateEffect - d)
+  normalValue  <- dnorm(currentDays, mean = totalDays/2.0,     sd = ((totalDays/2.0)/3.0) )
+  normalMax    <- dnorm(totalDays/2.0  , mean = totalDays/2.0, sd = ((totalDays/2.0)/3.0) )
+  
+  return( (normalValue)/normalMax)
+}
+
+generateFactorSinusoidal <- function(date) {
+  # This function generates the values of the factor k1 assuming a ``sinusoidal'' seasonal effect throughout the year
+  #
+  #
+  require(lubridate)
+  
+  d             <- date
+  year(d)       <- 2000
+  maxDateEffect <- springEquinox2000-1
+  year(maxDateEffect) <- 2000
+  # Any date posterior to the spring equinox is 'moved' to 1999. By this way, 
+  # our dates will range from 21-Mar-1999 to 20-Mar-2000, saving leap year and inter-year dates problems.
+  if (d>maxDateEffect) { 
+    year(d)<-1999
+  }
+  
+  firstDay <- springEquinox1999 # Our data is flattened to the 21-Mar-1999 to 20-Mar-2000 period
+  peakDay  <- winterSolstice1999+45 #- The peak of our wave will be in the middle of winter season (45 days beyond the winter solstice)
+  numDaysToPeak <- as.double(peakDay - firstDay, units="days")
+  numDaysDate   <- as.double(d - firstDay, units = "days")
+  convertFactor <- (2*pi)/366.0
+  
+  return ((cos((numDaysDate-numDaysToPeak)*convertFactor)+1.0)/2.0)
+}
+
+```
+
+# Condensed dataset
+
+In the _condensed_ dataset, we assume that the seasonal effect happens always (and only) in winter. We follow a Normal distribution to simulate the effect.
+
+The resulting dataset looks like:
+
+```{r plotCondensed, results='asis'}
+fileCondensed <-  paste0(datasetPath,"synth_condensed.rds")
+if (!file.exists(fileCondensed)) {
+  cat("(Synthetic dataset not found at ",normalizePath(fileCondensed))
+} else {
+  
+  datasetCondensed <- readRDS(file = paste0(datasetPath,"synth_condensed.rds"))  
+  
+  breaksLabels <- c("2099-12-21","2100-03-21", "2100-06-21", "2100-09-23",
+                  "2100-12-21","2101-03-21", "2101-06-21", "2101-09-23",
+                  "2101-12-21","2102-03-21", "2102-06-21", "2102-09-23")
+  breaks       <- as.Date(breaksLabels, format="%Y-%m-%d")
+
+  x_date       <- seq(as.Date("2100-01-01"),as.Date("2102-12-31"),by="day")
+  k1Plot       <-  unlist(mapply(generateFactorCondensed, x_date))
+  k2Plot       <-  max(k1Plot)-k1Plot
+  kData        <- data.frame(x_date, k1Plot, k2Plot)
+
+  dr <- datasetCondensed[datasetCondensed$test_date<as.Date("2103-01-01"),]
+
+  pcx1<-ggplot(dr,aes(x=test_date, y=x1, col=class))+
+      geom_point()+
+      scale_x_continuous(breaks=breaks, labels = breaksLabels) + 
+      theme(axis.text.x = element_text(angle=90,hjust=1))+
+      geom_line(data = kData, aes(x=x_date, y=k1Plot*20-10, color="Weight of the factor"))+scale_y_continuous(sec.axis=sec_axis(trans = ~(.+10)/20,name="Factor weight"))
+  
+  #print(pcx1)
+  
+  pcx2<-ggplot(dr,aes(x=test_date, y=x2, col=class))+
+      geom_point()+
+      scale_x_continuous(breaks=breaks, labels = breaksLabels) + 
+      theme(axis.text.x = element_text(angle=90,hjust=1))+
+      geom_line(data = kData, aes(x=x_date, y=k2Plot*20-10, color="Weight of the factor"))+scale_y_continuous(sec.axis=sec_axis(trans = ~(.+10)/20,name="Factor weight"))
+ 
+   #print(pcx2)
+
+   
+  #if (dumpImg) {
+  #  setEPS()
+  #  postscript(paste0(figurePath,"corrplot_condensed.eps"))
+  #}
+  cp1<-corrplot(cor(datasetCondensed[,numericCols]), method = "circle")    # Apply corrplot function
+
+  #print(cp1)
+  #if (dumpImg) {
+  #  dev.off()
+  #}
+   
+  if(dumpImg) ggsave(filename = paste0(figurePath,"synthetic-condensed-x1.eps"), plot = pcx1, device = cairo_ps, fallback_resolution = 600)  
+  if(dumpImg) ggsave(filename = paste0(figurePath,"synthetic-condensed-x2.eps"), plot = pcx2, device = cairo_ps, fallback_resolution = 600)  
+}
+
+```
+
+```{r printCondensed1, results='asis'}
+pcx1
+```
+
+```{r printCondensed2, results='asis'}
+pcx2
+```
+
+```{r printCondensed3, results='asis'}
+#cp1
+```
+
+# Sinusoidal dataset
+
+A common approach is to estimate the seasonal effects as a sinusoidal wave. In this dataset we assume that the factor $k_1$ follows a sinusoidal waveform whose maximum is reached in the middel of winter and its minimum in the middle of summer.
+
+The resulting dataset looks like:
+
+```{r plotSinusoidal, results='asis'}
+
+fileSinusoidal <-  paste0(datasetPath,"synth_sinusoidal.rds")
+if (!file.exists(fileSinusoidal)) {
+  cat("(Sinusoidal dataset not found at ",normalizePath(fileSinusoidal))
+} else {
+  datasetSinusoidal <- readRDS(file = paste0(datasetPath,"synth_condensed.rds"))  
+
+  breaksLabels <- c("2099-12-21","2100-03-21", "2100-06-21", "2100-09-23",
+                  "2100-12-21","2101-03-21", "2101-06-21", "2101-09-23",
+                  "2101-12-21","2102-03-21", "2102-06-21", "2102-09-23")
+  breaks       <- as.Date(breaksLabels, format="%Y-%m-%d")
+
+  x_date       <- seq(as.Date("2100-01-01"),as.Date("2102-12-31"),by="day")
+  k1Plot       <-  unlist(mapply(generateFactorSinusoidal, x_date))
+  k2Plot       <-  max(k1Plot)-k1Plot
+  kData        <- data.frame(x_date, k1Plot, k2Plot)
+
+  dr <- datasetSinusoidal[datasetSinusoidal$test_date<as.Date("2103-01-01"),]
+
+  psin1<-ggplot(dr,aes(x=test_date, y=x1, col=class))+
+      geom_point()+
+      scale_x_continuous(breaks=breaks, labels = breaksLabels) + 
+      theme(axis.text.x = element_text(angle=90,hjust=1))+
+      geom_line(data = kData, aes(x=x_date, y=k1Plot*20-10, color="Weight of the factor"))+scale_y_continuous(sec.axis=sec_axis(trans = ~(.+10)/20,name="Factor weight"))
+  
+  psin2<-ggplot(dr,aes(x=test_date, y=x2, col=class))+
+      geom_point()+
+      scale_x_continuous(breaks=breaks, labels = breaksLabels) + 
+      theme(axis.text.x = element_text(angle=90,hjust=1))+
+      geom_line(data = kData, aes(x=x_date, y=k2Plot*20-10, color="Weight of the factor"))+scale_y_continuous(sec.axis=sec_axis(trans = ~(.+10)/20,name="Factor weight"))
+  
+  #if (dumpImg) {
+  #  setEPS()
+  #  postscript(paste0(figurePath,"corrplot_sinusoidal.eps"))
+  #}
+  cp2<-corrplot(cor(datasetSinusoidal[,numericCols]), method = "circle")    # Apply corrplot function
+  #if (dumpImg) {
+  #  dev.off()
+  #}
+  
+  
+  if(dumpImg) ggsave(filename = paste0(figurePath,"synthetic-sinusoidal-x1.eps"), plot = pcx1, device = cairo_ps, fallback_resolution = 600)  
+  if(dumpImg) ggsave(filename = paste0(figurePath,"synthetic-sinusoidal-x2.eps"), plot = pcx2, device = cairo_ps, fallback_resolution = 600)  
+
+}
+```
+
+```{r printSinusoidal1, results='asis'}
+psin1
+```
+
+```{r printSinusoidal2, results='asis'}
+psin2
+```
+
+```{r printSinusoidal3, results='asis'}
+#cp2
+```
